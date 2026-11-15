@@ -74,17 +74,11 @@ FALLBACK_OPTS = {
     "OverTime": ["No", "Yes"],
 }
 
-# Notebook results supplied by the project owner (NOT re-verified by this app).
+# Notebook results typed in by the project owner; shown only when held-out data is unavailable, never as deployed-model metrics.
 NOTEBOOK = {
     "Standard Logistic Regression": dict(Accuracy=.8878, Precision=.7692, Recall=.4255, F1=.5479, AUC=.8296, CV=.5400),
     "Balanced Logistic Regression": dict(Accuracy=.7823, Precision=.3976, Recall=.7021, F1=.5077, AUC=.8240, CV=.5135),
 }
-# Reconstructed arithmetically from the reported metrics (assumes 294-row test set, 47 positives).
-RECON_CM = {
-    "Standard Logistic Regression": dict(TN=241, FP=6, FN=27, TP=20),
-    "Balanced Logistic Regression": dict(TN=197, FP=50, FN=14, TP=33),
-}
-
 PAGES = [
     ("Overview", "⌂"), ("Workforce Analytics", "◫"), ("Attrition Analysis", "◔"),
     ("Employee Explorer", "⌕"), ("Predict Attrition", "✦"), ("Model Performance", "◎"),
@@ -279,18 +273,24 @@ def prep(raw):
 
 @st.cache_resource(show_spinner="Loading prediction model…")
 def load_model():
+    """Returns (model, path, error, version_warning)."""
+    import warnings
     cands = [BASE / "employee_attrition_model.pkl", BASE / "models" / "employee_attrition_model.pkl",
              BASE / "model" / "employee_attrition_model.pkl", Path.cwd() / "employee_attrition_model.pkl"]
     for p in cands:
         if p.exists():
             try:
-                m = joblib.load(p)
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    m = joblib.load(p)
+                vw = "; ".join(sorted({str(x.message).strip()[:240] for x in w if "version" in str(x.message).lower()}))
                 if not hasattr(m, "predict_proba"):
-                    return None, str(p), "Loaded object has no predict_proba()."
-                return m, str(p), None
+                    return None, str(p), "Loaded object has no predict_proba().", ""
+                return m, str(p), None, vw
             except Exception as e:  # noqa: BLE001
-                return None, str(p), f"Could not load model: {e}"
-    return None, None, "employee_attrition_model.pkl was not found next to app.py."
+                return None, str(p), (f"Could not load the model ({type(e).__name__}): {e}. This is often caused by a "
+                                      "scikit-learn version different from the one used for training; install the training version."), ""
+    return None, None, "employee_attrition_model.pkl was not found next to app.py.", ""
 
 
 def model_features(model):
@@ -675,12 +675,14 @@ def report_text(r):
 
 def page_predict(df):
     header("Predict Employee Attrition", "Score an employee profile with the saved Logistic Regression pipeline.")
-    model, mpath, merr = load_model()
+    model, mpath, merr, vwarn = load_model()
     if model is None:
         empty_state("Prediction model unavailable",
                     f"{merr}<br>Add <code>employee_attrition_model.pkl</code> next to <code>app.py</code>. "
                     "No predictions are generated without the real model.")
         return
+    if vwarn:
+        note(f"Model loaded with a scikit-learn version warning: {vwarn}")
     features = model_features(model)
     if len(features) != 30:
         note(f"The loaded model reports {len(features)} input features (expected 30). Proceeding with the model's own feature list.")
@@ -804,18 +806,75 @@ def page_predict(df):
 
 
 # ---- Model performance ---------------------------------------------------------
-@st.cache_data(show_spinner="Evaluating model on loaded dataset…")
-def insample_eval(_model, X, y, features):
-    from sklearn.metrics import (accuracy_score, f1_score, precision_score, recall_score,
-                                 roc_auc_score, roc_curve, confusion_matrix)
+TARGET = "Attrition"
+EXPECTED_TEST_ROWS = 294
+HELDOUT_FILENAME = "heldout_test_data.csv"
+UNAVAILABLE_MSG = "Held-out evaluation data unavailable. Upload the test dataset to verify model performance."
+
+
+def find_heldout():
+    """Look ONLY for the exported held-out test file. Never falls back to the full dataset."""
+    for d in (BASE, BASE / "data", BASE / "dataset", Path.cwd(), Path.cwd() / "data"):
+        p = d / HELDOUT_FILENAME
+        if p.exists():
+            try:
+                return pd.read_csv(p), str(p), None
+            except Exception as e:  # noqa: BLE001
+                return None, str(p), f"Could not read {p.name}: {e}"
+    return None, None, None
+
+
+def validate_heldout(raw, features):
+    """Validate a held-out file. Returns (X, y, error)."""
+    if TARGET not in raw.columns:
+        return None, None, f"The test file must contain the actual labels in a column named '{TARGET}'."
+    missing = [f for f in features if f not in raw.columns]
+    if missing:
+        return None, None, f"The test file is missing model features: {', '.join(missing)}."
+    if len(raw) != EXPECTED_TEST_ROWS:
+        return None, None, (f"The file has {len(raw):,} rows, but the held-out test set must contain exactly "
+                            f"{EXPECTED_TEST_ROWS} records. Full or training datasets are not accepted.")
+    y = raw[TARGET]
+    if y.dtype == object:
+        y = y.astype(str).str.strip().str.lower().map({"yes": 1, "no": 0, "1": 1, "0": 0})
+    if y.isna().any() or not set(pd.unique(y)) <= {0, 1}:
+        return None, None, f"'{TARGET}' must contain only 0/1 (or Yes/No) labels."
+    return raw[list(features)].copy(), y.astype(int), None
+
+
+@st.cache_data(show_spinner="Evaluating deployed model on the held-out test set…")
+def evaluate_heldout(_model, X, y, features):
+    from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, f1_score,
+                                 precision_recall_curve, precision_score, recall_score, roc_auc_score, roc_curve)
     classes = list(_model.classes_)
     pos = 1 if 1 in classes else ("Yes" if "Yes" in classes else classes[-1])
-    proba = _model.predict_proba(X[list(features)])[:, classes.index(pos)]
-    pred = (proba >= 0.5).astype(int)
-    fpr, tpr, _ = roc_curve(y, proba)
-    return dict(Accuracy=accuracy_score(y, pred), Precision=precision_score(y, pred, zero_division=0),
-                Recall=recall_score(y, pred), F1=f1_score(y, pred), AUC=roc_auc_score(y, proba),
-                fpr=fpr, tpr=tpr, cm=confusion_matrix(y, pred))
+    Xf = X[list(features)]
+    proba = _model.predict_proba(Xf)[:, classes.index(pos)]
+    pred = (np.asarray(_model.predict(Xf)) == pos).astype(int)
+    out = dict(
+        n=int(len(y)), n_pos=int(y.sum()),
+        Accuracy=accuracy_score(y, pred), Precision=precision_score(y, pred, zero_division=0),
+        Recall=recall_score(y, pred, zero_division=0), F1=f1_score(y, pred, zero_division=0),
+        cm=confusion_matrix(y, pred, labels=[0, 1]),
+        report=classification_report(y, pred, labels=[0, 1], target_names=["Stayed", "Left"],
+                                     output_dict=True, zero_division=0),
+        AUC=None, fpr=None, tpr=None, prec_c=None, rec_c=None,
+    )
+    if y.nunique() == 2:
+        out["AUC"] = roc_auc_score(y, proba)
+        out["fpr"], out["tpr"], _ = roc_curve(y, proba)
+        out["prec_c"], out["rec_c"], _ = precision_recall_curve(y, proba)
+    return out
+
+
+@st.cache_data(show_spinner="Running in-sample sanity check…")
+def insample_check(_model, X, features):
+    classes = list(_model.classes_)
+    pos = 1 if 1 in classes else ("Yes" if "Yes" in classes else classes[-1])
+    Xf = X[list(features)]
+    proba = _model.predict_proba(Xf)[:, classes.index(pos)]
+    pred = (np.asarray(_model.predict(Xf)) == pos).astype(int)
+    return dict(n=int(len(Xf)), mean_p=float(proba.mean()), pred_rate=float(pred.mean()))
 
 
 def cm_fig(cm, title):
@@ -830,115 +889,145 @@ def cm_fig(cm, title):
 
 
 def page_model(df):
-    header("Model Performance", "Evaluation of the Logistic Regression attrition classifier.")
-    note("Metrics below are the <b>notebook experiment results</b> supplied for this project. This app has not independently "
-         "verified that the deployed <code>.pkl</code> reproduces them.")
-    s = NOTEBOOK["Standard Logistic Regression"]
-    bl = NOTEBOOK["Balanced Logistic Regression"]
-    kpi_row([("Accuracy (standard)", f"{s['Accuracy'] * 100:.2f}%", f"Balanced: {bl['Accuracy'] * 100:.2f}%", C_ACC),
-             ("Precision (standard)", f"{s['Precision'] * 100:.2f}%", f"Balanced: {bl['Precision'] * 100:.2f}%", C_CYAN),
-             ("Recall (standard)", f"{s['Recall'] * 100:.2f}%", f"Balanced: {bl['Recall'] * 100:.2f}%", C_WARN),
-             ("F1 (standard)", f"{s['F1'] * 100:.2f}%", f"Balanced: {bl['F1'] * 100:.2f}%", C_OK),
-             ("ROC-AUC (standard)", f"{s['AUC']:.4f}", f"Balanced: {bl['AUC']:.4f}", C_ACC)])
-    names = list(NOTEBOOK)
-    c1, c2 = st.columns(2)
-    with c1:
-        fig = go.Figure()
-        for nm, colr in zip(names, [C_ACC, C_CYAN]):
-            v = NOTEBOOK[nm]
-            fig.add_bar(name=nm.replace(" Logistic Regression", ""), x=["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"],
-                        y=[v["Accuracy"], v["Precision"], v["Recall"], v["F1"], v["AUC"]], marker_color=colr,
-                        text=[f"{x:.3f}" for x in (v["Accuracy"], v["Precision"], v["Recall"], v["F1"], v["AUC"])],
-                        textposition="outside")
-        fig.update_layout(title="Model Comparison (notebook)", barmode="group")
-        fig.update_yaxes(range=[0, 1.1])
-        show(fig)
-    with c2:
-        fig = go.Figure()
-        for nm, colr in zip(names, [C_ACC, C_CYAN]):
-            v = NOTEBOOK[nm]
-            fig.add_trace(go.Scatter(x=[v["Recall"]], y=[v["Precision"]], mode="markers+text",
-                                     name=nm.replace(" Logistic Regression", ""), text=[nm.split()[0]],
-                                     textposition="top center", marker=dict(size=22, color=colr)))
-        fig.update_layout(title="Precision vs Recall Trade-off", xaxis_title="Recall", yaxis_title="Precision")
-        fig.update_xaxes(range=[0, 1])
-        fig.update_yaxes(range=[0, 1])
-        show(fig)
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        show(cm_fig(RECON_CM[names[0]], "Confusion Matrix · Standard"))
-    with c2:
-        show(cm_fig(RECON_CM[names[1]], "Confusion Matrix · Balanced"))
-    with c3:
-        fig = go.Figure(go.Bar(x=[n.split()[0] for n in names], y=[NOTEBOOK[n]["CV"] for n in names],
-                               marker_color=[C_ACC, C_CYAN], text=[f"{NOTEBOOK[n]['CV']:.4f}" for n in names],
-                               textposition="outside"))
-        fig.update_layout(title="5-Fold CV · Mean F1")
-        fig.update_yaxes(range=[0, 1])
-        show(fig)
-    insight("Confusion matrices are <b>reconstructed arithmetically</b> from the reported metrics, assuming a 294-row test set "
-            "with 47 leavers; they reproduce the reported accuracy, precision and recall exactly, but please verify against your notebook. "
-            "Only mean CV F1 values were provided, so per-fold scores are not shown.")
-
-    section("Why accuracy alone is not enough")
-    base = f"{(1 - df['AttritionFlag'].mean()) * 100:.1f}%" if df is not None else "a high share"
-    st.markdown(
-        f'<div class="glass"><ul><li>Attrition is an <b>imbalanced</b> problem: always predicting “Stayed” would already score about <b>{base}</b> accuracy in this dataset while catching no leavers.</li>'
-        f'<li>The standard model has the higher accuracy but finds only <b>{s["Recall"] * 100:.1f}%</b> of leavers; the balanced model finds <b>{bl["Recall"] * 100:.1f}%</b> at the cost of many more false alarms (precision {bl["Precision"] * 100:.1f}%).</li>'
-        "<li>Which trade-off is better depends on the cost of a missed leaver versus a wasted retention conversation. Precision, recall, F1 and ROC-AUC should be read together.</li></ul></div>",
-        unsafe_allow_html=True)
-
-    model, _, merr = load_model()
-    section("Logistic Regression coefficient analysis")
+    header("Model Performance", "Held-out evaluation of the deployed Logistic Regression attrition classifier.")
+    model, mpath, merr, vwarn = load_model()
     if model is None:
         empty_state("Model not loaded", merr or "")
-    else:
-        try:
-            names_out = model[:-1].get_feature_names_out()
-            coef = model[-1].coef_[0]
-            cdf = pd.DataFrame({"Feature": [str(n).split("__", 1)[-1] for n in names_out], "Coefficient": coef})
-            top = pd.concat([cdf.nlargest(10, "Coefficient"), cdf.nsmallest(10, "Coefficient")]).drop_duplicates()
-            top = top.sort_values("Coefficient")
-            fig = go.Figure(go.Bar(x=top["Coefficient"], y=top["Feature"], orientation="h",
-                                   marker_color=[C_BAD if v > 0 else C_CYAN for v in top["Coefficient"]],
-                                   hovertemplate="<b>%{y}</b><br>Coefficient: %{x:.3f}<extra></extra>"))
-            fig.update_layout(title="Largest coefficients (positive = higher predicted attrition odds)")
-            show(fig, 560)
-            insight("Coefficients apply to standardized numeric and one-hot encoded features, so magnitudes are comparable "
-                    "within the model but describe association learned by the model, not causal effects.")
-        except Exception as e:  # noqa: BLE001
-            note(f"Coefficients could not be extracted from this model object ({e}).")
+        return
+    if vwarn:
+        note(f"Model loaded with a scikit-learn version warning: {vwarn}. Install the version used for training "
+             "if results look wrong.")
+    features = model_features(model)
 
-    section("Live check on the loaded dataset")
-    if model is None or df is None:
-        empty_state("Unavailable", "Both the dataset and the model are required.")
+    # ---- held-out data source (never the full / training dataset) ----
+    disk_raw, disk_path, disk_err = find_heldout()
+    with st.expander("Held-out test data source",
+                     expanded=(disk_raw is None and st.session_state.get("ho_upload") is None)):
+        st.caption(f"Expected: {EXPECTED_TEST_ROWS} held-out records with the {len(features)} model features and the "
+                   f"actual labels in '{TARGET}' (file name: {HELDOUT_FILENAME}).")
+        up = st.file_uploader("Upload held-out test dataset (CSV)", type="csv", key="ho_upload")
+    raw, src, rerr = None, None, disk_err
+    if up is not None:
+        try:
+            raw, src, rerr = pd.read_csv(up), f"Uploaded file: {up.name}", None
+        except Exception as e:  # noqa: BLE001
+            rerr = f"Could not read the uploaded file: {e}"
+    elif disk_raw is not None:
+        raw, src = disk_raw, disk_path
+
+    X = y = res = None
+    verr = rerr
+    if raw is not None and verr is None:
+        X, y, verr = validate_heldout(raw, features)
+    if X is not None:
+        try:
+            res = evaluate_heldout(model, X, y, tuple(features))
+        except Exception as e:  # noqa: BLE001
+            verr = (f"Evaluation failed ({type(e).__name__}): {e}. This can happen when the model was saved with a "
+                    "different scikit-learn version than the one installed.")
+
+    if res is None:
+        if verr:
+            st.error(verr)
+        empty_state("Held-out evaluation unavailable", UNAVAILABLE_MSG)
+        with st.expander("Notebook experiment reference (user-reported, not computed by this app)"):
+            note("These figures were typed in from the notebook and are <b>not verified</b> against the deployed model.")
+            ref = pd.DataFrame(NOTEBOOK).T.reset_index().rename(columns={"index": "Experiment", "CV": "CV mean F1"})
+            table(ref.round(4), 150)
     else:
-        with st.expander("Run in-sample evaluation (ROC curve and metrics)"):
-            note("This scores the <b>entire loaded dataset</b>, which likely overlaps with the model's training data. "
-                 "Treat it as an in-sample sanity check, not as held-out performance.")
-            if st.button("Run evaluation", key="run_eval"):
+        st.caption(f"Evaluated the deployed model on {res['n']} held-out records ({res['n_pos']} leavers) · "
+                   f"source: {Path(src.split(': ')[-1]).name if src else '—'}")
+        auc = res["AUC"]
+        kpi_row([("Accuracy", f"{res['Accuracy'] * 100:.2f}%", "Held-out test set", C_ACC),
+                 ("Precision", f"{res['Precision'] * 100:.2f}%", "Left class", C_CYAN),
+                 ("Recall", f"{res['Recall'] * 100:.2f}%", "Left class", C_WARN),
+                 ("F1-Score", f"{res['F1'] * 100:.2f}%", "Left class", C_OK),
+                 ("ROC-AUC", f"{auc:.4f}" if auc is not None else "n/a", "Held-out test set", C_ACC)])
+        cm = res["cm"]
+        cmd = dict(TN=int(cm[0][0]), FP=int(cm[0][1]), FN=int(cm[1][0]), TP=int(cm[1][1]))
+        c1, c2 = st.columns(2)
+        with c1:
+            show(cm_fig(cmd, "Confusion Matrix (held-out)"))
+        with c2:
+            if res["fpr"] is not None:
+                fig = go.Figure()
+                fig.add_scatter(x=res["fpr"], y=res["tpr"], mode="lines", line=dict(color=C_ACC, width=3), name="Model")
+                fig.add_scatter(x=[0, 1], y=[0, 1], mode="lines", line=dict(color="#64748B", dash="dot"), name="Chance")
+                fig.update_layout(title=f"ROC Curve (AUC {auc:.4f})", xaxis_title="False positive rate",
+                                  yaxis_title="True positive rate")
+                show(fig)
+            else:
+                empty_state("ROC unavailable", "The test labels contain only one class.")
+        c1, c2 = st.columns(2)
+        with c1:
+            vals = [res["Accuracy"], res["Precision"], res["Recall"], res["F1"], auc if auc is not None else 0]
+            names = ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"]
+            fig = go.Figure(go.Bar(x=names, y=vals, marker_color=[C_ACC, C_CYAN, C_WARN, C_OK, C_ACC],
+                                   text=[f"{v:.3f}" for v in vals], textposition="outside"))
+            fig.update_layout(title="Deployed Model Metrics (held-out)", showlegend=False)
+            fig.update_yaxes(range=[0, 1.1])
+            show(fig)
+        with c2:
+            if res["rec_c"] is not None:
+                fig = go.Figure(go.Scatter(x=res["rec_c"], y=res["prec_c"], mode="lines",
+                                           line=dict(color=C_CYAN, width=3), fill="tozeroy",
+                                           fillcolor="rgba(34,211,238,.10)"))
+                fig.update_layout(title="Precision vs Recall Curve", xaxis_title="Recall", yaxis_title="Precision")
+                fig.update_yaxes(range=[0, 1.05])
+                show(fig)
+        section("Classification report")
+        rep = res["report"]
+        rows = []
+        for k in ("Stayed", "Left", "macro avg", "weighted avg"):
+            r = rep[k]
+            rows.append([k, r["precision"], r["recall"], r["f1-score"], int(r["support"])])
+        rows.append(["accuracy", np.nan, np.nan, rep["accuracy"], res["n"]])
+        rdf = pd.DataFrame(rows, columns=["Class", "Precision", "Recall", "F1-score", "Support"]).round(4)
+        table(rdf, 260)
+
+        section("Why accuracy alone is not enough")
+        base = max(res["n_pos"], res["n"] - res["n_pos"]) / res["n"] * 100
+        st.markdown(
+            f'<div class="glass"><ul><li>Attrition is an <b>imbalanced</b> problem: predicting the majority class for every employee '
+            f'would score <b>{base:.1f}%</b> accuracy on this test set while catching none of the {res["n_pos"]} leavers.</li>'
+            f'<li>On this test set the deployed model finds <b>{res["Recall"] * 100:.1f}%</b> of leavers (recall) with '
+            f'<b>{res["Precision"] * 100:.1f}%</b> of its “Left” predictions correct (precision).</li>'
+            "<li>The right balance depends on the cost of a missed leaver versus a wasted retention conversation; read precision, recall, F1 and ROC-AUC together.</li></ul></div>",
+            unsafe_allow_html=True)
+
+    section("Logistic Regression coefficient analysis")
+    try:
+        names_out = model[:-1].get_feature_names_out()
+        coef = model[-1].coef_[0]
+        cdf = pd.DataFrame({"Feature": [str(n).split("__", 1)[-1] for n in names_out], "Coefficient": coef})
+        top = pd.concat([cdf.nlargest(10, "Coefficient"), cdf.nsmallest(10, "Coefficient")]).drop_duplicates()
+        top = top.sort_values("Coefficient")
+        fig = go.Figure(go.Bar(x=top["Coefficient"], y=top["Feature"], orientation="h",
+                               marker_color=[C_BAD if v > 0 else C_CYAN for v in top["Coefficient"]],
+                               hovertemplate="<b>%{y}</b><br>Coefficient: %{x:.3f}<extra></extra>"))
+        fig.update_layout(title="Largest coefficients (positive = higher predicted attrition odds)")
+        show(fig, 560)
+        insight("Coefficients apply to standardized numeric and one-hot encoded features, so magnitudes are comparable "
+                "within the model but describe association learned by the model, not causal effects.")
+    except Exception as e:  # noqa: BLE001
+        note(f"Coefficients could not be extracted from this model object ({e}).")
+
+    section("In-Sample Sanity Check — Not a Model Performance Metric.")
+    if df is None:
+        empty_state("Unavailable", "The full dataset is required for this check.")
+    else:
+        with st.expander("Run full-dataset prediction check"):
+            note("This scores the <b>entire loaded dataset</b>, which overlaps the training data. It only confirms the "
+                 "saved pipeline runs end-to-end on every row and must <b>not</b> be quoted as model performance.")
+            if st.button("Run sanity check", key="run_sanity"):
                 try:
-                    feats = tuple(model_features(model))
-                    res = insample_eval(model, df[list(feats)], df["AttritionFlag"], feats)
-                    kpi_row([("Accuracy", f"{res['Accuracy'] * 100:.2f}%", "In-sample, threshold 0.5", C_ACC),
-                             ("Precision", f"{res['Precision'] * 100:.2f}%", "In-sample", C_CYAN),
-                             ("Recall", f"{res['Recall'] * 100:.2f}%", "In-sample", C_WARN),
-                             ("F1", f"{res['F1'] * 100:.2f}%", "In-sample", C_OK),
-                             ("ROC-AUC", f"{res['AUC']:.4f}", "In-sample", C_ACC)])
-                    a, b = st.columns(2)
-                    with a:
-                        fig = go.Figure()
-                        fig.add_scatter(x=res["fpr"], y=res["tpr"], mode="lines", line=dict(color=C_ACC, width=3), name="Model")
-                        fig.add_scatter(x=[0, 1], y=[0, 1], mode="lines", line=dict(color="#64748B", dash="dot"), name="Chance")
-                        fig.update_layout(title="ROC Curve (in-sample)", xaxis_title="False positive rate",
-                                          yaxis_title="True positive rate")
-                        show(fig)
-                    with b:
-                        cm = res["cm"]
-                        show(cm_fig(dict(TN=int(cm[0][0]), FP=int(cm[0][1]), FN=int(cm[1][0]), TP=int(cm[1][1])),
-                                    "Confusion Matrix (in-sample)"))
+                    r = insample_check(model, df[list(features)], tuple(features))
+                    kpi_row([("Rows scored", f"{r['n']:,}", "Pipeline ran without errors", C_OK),
+                             ("Mean predicted probability", f"{r['mean_p'] * 100:.1f}%", "Average P(Left)", C_CYAN),
+                             ("Predicted leaver share", f"{r['pred_rate'] * 100:.1f}%", "Class predictions", C_WARN),
+                             ("Observed attrition rate", f"{df['AttritionFlag'].mean() * 100:.1f}%", "Dataset label", C_ACC)])
                 except Exception as e:  # noqa: BLE001
-                    st.error(f"Evaluation failed: {e}")
+                    st.error(f"Sanity check failed ({type(e).__name__}): {e}")
 
 
 # ---- Business insights ---------------------------------------------------------
@@ -1047,13 +1136,16 @@ def page_insights(df):
 
 def page_about(df, src, refreshed, derr):
     header("Settings / About", "Application status, data sources and limitations.")
-    model, mpath, merr = load_model()
+    model, mpath, merr, vwarn = load_model()
+    ho, hpath, herr = find_heldout()
     import sklearn
     rows = [
         ("Dataset", f"Loaded · {len(df):,} rows × {df.shape[1]} columns" if df is not None else f"Unavailable — {derr}"),
         ("Dataset file", src or "—"),
         ("Model", f"Loaded · {type(model).__name__}" if model is not None else f"Unavailable — {merr}"),
         ("Model file", mpath or "—"),
+        ("Model load warning", vwarn or "None"),
+        ("Held-out test file", hpath or "Not found (upload on the Model Performance page)"),
         ("Python libs", f"streamlit {st.__version__} · pandas {pd.__version__} · scikit-learn {sklearn.__version__}"),
     ]
     st.markdown('<div class="glass"><h3>System status</h3><ul>' +
@@ -1062,7 +1154,7 @@ def page_about(df, src, refreshed, derr):
         '<div class="glass"><h3>Limitations</h3><ul>'
         "<li>The dataset is a static snapshot; no historical trends are shown.</li>"
         "<li>Coded fields (satisfaction, education, etc.) are labelled using the standard IBM HR data dictionary.</li>"
-        "<li>Model metrics on the Model Performance page are notebook results and are not re-verified here.</li>"
+        "<li>Model metrics are computed only from the 294-record held-out test file; without it, no performance metrics are shown.</li>"
         "<li>Predictions are statistical estimates and should support, not replace, HR judgement. Risk bands are application-defined.</li>"
         "<li>Employee identifiers are hashed into anonymous references.</li></ul></div>", unsafe_allow_html=True)
     if st.button("Clear cached data and model", key="clear_cache"):
