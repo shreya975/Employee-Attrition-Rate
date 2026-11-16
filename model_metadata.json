@@ -1,0 +1,38 @@
+{
+  "model_file": "employee_attrition_model.pkl",
+  "model_type": "Logistic Regression",
+  "sklearn_version": "1.8.0",
+  "pandas_version": "2.2.3",
+  "numpy_version": "2.3.5",
+  "joblib_version": "1.5.3",
+  "input_feature_count": 30,
+  "target_mapping": {
+    "No": 0,
+    "Yes": 1
+  },
+  "train_test_split": {
+    "test_size": 0.2,
+    "random_state": 10,
+    "stratify": true
+  },
+  "metrics": {
+    "accuracy": 0.8877551020408163,
+    "precision": 0.7692307692307693,
+    "recall": 0.425531914893617,
+    "f1": 0.547945205479452,
+    "roc_auc": 0.8296149539150659,
+    "cv_standard_mean_f1": 0.5399562728059664,
+    "cv_balanced_mean_f1": 0.5134873723589599,
+    "selected_model": "Logistic Regression"
+  },
+  "confusion_matrix": [
+    [
+      241,
+      6
+    ],
+    [
+      27,
+      20
+    ]
+  ]
+}
